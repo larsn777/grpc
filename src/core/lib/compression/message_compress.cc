@@ -25,6 +25,9 @@
 #include <zconf.h>
 #include <zlib.h>
 
+#include <zstd.h>
+#include <zstd_errors.h>
+
 #include <grpc/slice_buffer.h>
 #include <grpc/support/alloc.h>
 #include <grpc/support/log.h>
@@ -142,6 +145,202 @@ static int zlib_decompress(grpc_slice_buffer* input, grpc_slice_buffer* output,
   return r;
 }
 
+void errorZDecompress(ZSTD_DStream** pStream, size_t countBefore, size_t lengthBefore, grpc_slice_buffer *outbuf, grpc_slice * out) {
+  if (out != nullptr) {
+    grpc_core::CSliceUnref(*out);
+  }
+
+  if (pStream != nullptr) {
+      auto err = ZSTD_freeDStream(*pStream);
+      if (ZSTD_isError(err) > 0) {
+          gpr_log(GPR_INFO, "zstd: decompress flush all error  :%s", ZSTD_getErrorName(err));
+      }
+  }
+
+  for (size_t i = countBefore; i < outbuf->count; i++) {
+    grpc_core::CSliceUnref(outbuf->slices[i]);
+  }
+  outbuf->count = countBefore;
+  outbuf->length = lengthBefore;
+}
+
+void errorZCompress(ZSTD_CStream** pStream, size_t countBefore, size_t lengthBefore, grpc_slice_buffer *outbuf, grpc_slice * out) {
+  if (out != nullptr) {
+    grpc_core::CSliceUnref(*out);
+  }
+
+  if (pStream != nullptr) {
+      auto err = ZSTD_freeCStream(*pStream);
+      if (ZSTD_isError(err) > 0) {
+          gpr_log(GPR_INFO, "zstd: decompress flush all error  :%s", ZSTD_getErrorName(err));
+      }
+  }
+
+  for (size_t i = countBefore; i < outbuf->count; i++) {
+    grpc_core::CSliceUnref(outbuf->slices[i]);
+  }
+  outbuf->count = countBefore;
+  outbuf->length = lengthBefore;
+}
+
+static int zstd_compress(grpc_slice_buffer* input, grpc_slice_buffer* output) {
+
+  size_t count_before = output->count;
+  size_t length_before = output->length;
+
+  ZSTD_CStream* pStream = ZSTD_createCStream();
+  ZSTD_inBuffer   inBuffer;
+  ZSTD_outBuffer outBuffer;
+
+  size_t err = ZSTD_initCStream(pStream, 3);
+  if (ZSTD_isError(err) > 0) {
+    gpr_log(GPR_INFO, "zstd: initialize compress steram error :%s", ZSTD_getErrorName(err));
+    errorZCompress(&pStream, count_before, length_before, output, nullptr);
+    return 0;
+  }
+
+  grpc_slice outbuf = GRPC_SLICE_MALLOC(OUTPUT_BLOCK_SIZE);
+  outBuffer.size = static_cast<uInt> GRPC_SLICE_LENGTH(outbuf);
+  outBuffer.dst = GRPC_SLICE_START_PTR(outbuf);
+  outBuffer.pos = 0;
+  const uInt uint_max = ~static_cast<uInt>(0);
+  GPR_ASSERT(GRPC_SLICE_LENGTH(outbuf) <= uint_max);
+
+  for (size_t i = 0; i < input->count; i++) {
+    GPR_ASSERT(GRPC_SLICE_LENGTH(input->slices[i]) <= uint_max);
+    inBuffer.src = GRPC_SLICE_START_PTR(input->slices[i]);
+    inBuffer.size = GRPC_SLICE_LENGTH(input->slices[i]);
+    inBuffer.pos = 0;
+
+    err = ZSTD_compressStream2(pStream, &outBuffer, &inBuffer, ZSTD_EndDirective::ZSTD_e_continue);
+    if (ZSTD_isError(err) > 0) {
+      gpr_log(GPR_INFO, "zstd: compress stream error :%s", ZSTD_getErrorName(err));
+      errorZCompress(&pStream, count_before, length_before, output, &outbuf);
+      return 0;
+    }
+
+    auto lastChunk = (i == (input->count - 1));
+    bool finished = false;
+
+    while (!finished) {
+      if (outBuffer.pos == outBuffer.size) {
+        grpc_slice_buffer_add_indexed(output, outbuf);
+
+        outbuf = GRPC_SLICE_MALLOC(OUTPUT_BLOCK_SIZE);
+        outBuffer.size = static_cast<uInt> GRPC_SLICE_LENGTH(outbuf);
+        outBuffer.dst = GRPC_SLICE_START_PTR(outbuf);
+        outBuffer.pos = 0;
+      }
+
+      ZSTD_EndDirective directive = lastChunk ? ZSTD_EndDirective::ZSTD_e_end: ZSTD_EndDirective::ZSTD_e_flush;
+      err = ZSTD_compressStream2(pStream, &outBuffer, &inBuffer, directive);
+      if (ZSTD_isError(err) > 0) {
+        gpr_log(GPR_INFO, "zstd: compress flush all error  :%s", ZSTD_getErrorName(err));
+        errorZCompress(&pStream, count_before, length_before, output, &outbuf);
+        return 0;
+      }
+
+      finished = lastChunk ? err == 0 : inBuffer.pos == inBuffer.size;
+    }
+
+    if (inBuffer.pos != inBuffer.size) {
+      gpr_log(GPR_INFO, "zstd: not all input consumed");
+      errorZCompress(&pStream, count_before, length_before, output, &outbuf);
+      return 0;
+    }
+  }
+
+  err = ZSTD_freeCStream(pStream);
+  if (ZSTD_isError(err) > 0) {
+    gpr_log(GPR_INFO, "zstd: compress flush all error  :%s", ZSTD_getErrorName(err));
+    errorZCompress(nullptr, count_before, length_before, output, &outbuf);
+    return 0;
+  }
+
+  GPR_ASSERT(outbuf.refcount);
+  outbuf.data.refcounted.length = outBuffer.pos;
+  grpc_slice_buffer_add_indexed(output, outbuf);
+
+  if (output->length > input->length){
+    gpr_log(GPR_INFO, "zstd: fail to apply compression");
+    errorZCompress(nullptr, count_before, length_before, output, nullptr);
+    return 0;
+  }
+  return 1;
+}
+
+static int zstd_decompress(grpc_slice_buffer* input, grpc_slice_buffer* output) {
+
+  size_t count_before = output->count;
+  size_t length_before = output->length;
+
+  ZSTD_DStream* pStream = ZSTD_createDStream();
+  ZSTD_inBuffer   inBuffer;
+  ZSTD_outBuffer outBuffer;
+
+  size_t err = ZSTD_initDStream(pStream);
+  if (ZSTD_isError(err) > 0) {
+    gpr_log(GPR_INFO, "zstd: initialize decompress steram error :%s", ZSTD_getErrorName(err));
+    errorZDecompress(&pStream, count_before, length_before, output, nullptr);
+    return 0;
+  }
+
+  grpc_slice outbuf = GRPC_SLICE_MALLOC(OUTPUT_BLOCK_SIZE);
+  outBuffer.size = static_cast<uInt> GRPC_SLICE_LENGTH(outbuf);
+  outBuffer.dst = GRPC_SLICE_START_PTR(outbuf);
+  outBuffer.pos = 0;
+  const uInt uint_max = ~static_cast<uInt>(0);
+  GPR_ASSERT(GRPC_SLICE_LENGTH(outbuf) <= uint_max);
+
+  for (size_t i = 0; i < input->count; i++) {
+    GPR_ASSERT(GRPC_SLICE_LENGTH(input->slices[i]) <= uint_max);
+    inBuffer.src = GRPC_SLICE_START_PTR(input->slices[i]);
+    inBuffer.size = GRPC_SLICE_LENGTH(input->slices[i]);
+    inBuffer.pos = 0;
+
+    do
+    {
+      if (outBuffer.pos == outBuffer.size) {
+        grpc_slice_buffer_add_indexed(output, outbuf);
+
+        outbuf = GRPC_SLICE_MALLOC(OUTPUT_BLOCK_SIZE);
+        outBuffer.size = static_cast<uInt> GRPC_SLICE_LENGTH(outbuf);
+        outBuffer.dst = GRPC_SLICE_START_PTR(outbuf);
+        outBuffer.pos = 0;
+      }
+
+      err = ZSTD_decompressStream(pStream, &outBuffer, &inBuffer);
+      if (ZSTD_isError(err) > 0) {
+        gpr_log(GPR_INFO, "zstd: decompress stream error :%s", ZSTD_getErrorName(err));
+        errorZDecompress(&pStream, count_before, length_before, output,
+                         &outbuf);
+      }
+      if (outBuffer.pos < outBuffer.size) {
+        break;
+      }
+    } while (true);
+
+    if (inBuffer.pos != inBuffer.size) {
+      gpr_log(GPR_INFO, "zstd: not all input consumed");
+      errorZDecompress(&pStream, count_before, length_before, output, &outbuf);
+      return 0;
+    }
+  }
+
+  GPR_ASSERT(outbuf.refcount);
+  outbuf.data.refcounted.length = outBuffer.pos;
+  grpc_slice_buffer_add_indexed(output, outbuf);
+
+  err = ZSTD_freeDStream(pStream);
+  if (ZSTD_isError(err) > 0) {
+    gpr_log(GPR_INFO, "zstd: decompress flush all error  :%s", ZSTD_getErrorName(err));
+    errorZDecompress(nullptr, count_before, length_before, output, nullptr);
+    return 0;
+  }
+
+  return 1;
+}
+
 static int copy(grpc_slice_buffer* input, grpc_slice_buffer* output) {
   size_t i;
   for (i = 0; i < input->count; i++) {
@@ -161,6 +360,8 @@ static int compress_inner(grpc_compression_algorithm algorithm,
       return zlib_compress(input, output, 0);
     case GRPC_COMPRESS_GZIP:
       return zlib_compress(input, output, 1);
+    case GRPC_COMPRESS_ZSTD:
+      return zstd_compress(input, output);
     case GRPC_COMPRESS_ALGORITHMS_COUNT:
       break;
   }
@@ -186,6 +387,8 @@ int grpc_msg_decompress(grpc_compression_algorithm algorithm,
       return zlib_decompress(input, output, 0);
     case GRPC_COMPRESS_GZIP:
       return zlib_decompress(input, output, 1);
+    case GRPC_COMPRESS_ZSTD:
+      return zstd_decompress(input, output);
     case GRPC_COMPRESS_ALGORITHMS_COUNT:
       break;
   }

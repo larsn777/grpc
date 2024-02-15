@@ -62,6 +62,7 @@ typedef enum {
   GRPC_COMPRESS_DEFLATE,
   GRPC_COMPRESS_GZIP,
   /* TODO(ctiller): snappy */
+  GRPC_COMPRESS_ZSTD,
   GRPC_COMPRESS_ALGORITHMS_COUNT
 } grpc_compression_algorithm;
 
